@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import typing as tp
 import itertools
 from neat.activations import Activations
+from neat.init_schemes import InitSchemes
 
 
 class NodeType(Enum):
@@ -39,7 +40,23 @@ class ConnectionGene:
     out_node: NodeGene
     weight: float
     enabled: bool
-    innovation: int
+    # innovation: int
+
+    current_innovation: tp.ClassVar[int] = 0
+    innovation_history: tp.ClassVar[tp.Dict[tp.Tuple[int], int]] = {}
+
+    def __post_init__(self):
+        cls = self.__class__
+        if (self.in_node.id, self.out_node.id) in cls.innovation_history:
+            self.innovation = cls.innovation_history[
+                (self.in_node.id, self.out_node.id)
+            ]
+        else:
+            cls.current_innovation += 1
+            self.innovation = cls.current_innovation
+            cls.innovation_history[(self.in_node.id, self.out_node.id)] = (
+                self.innovation
+            )
 
 
 @dataclass
@@ -57,9 +74,12 @@ class Genome:
         int, tp.List[tp.Tuple[NodeGene, tp.Sequence[ConnectionGene]]]
     ] = dataclasses.field(default_factory=dict)
     max_layer: int = 0
+    species_id: int = 0
+    fitness_function: tp.Callable[["Genome"], float] = None
 
     def __post_init__(self):
         self.max_nodes: int = len(self.inputs) + len(self.outputs) + len(self.hidden)
+        self._fitness: float = 0
         self.build_graph()
 
     @classmethod
@@ -68,8 +88,9 @@ class Genome:
         population: int,
         input_nodes: int,
         output_nodes: int,
-        init_scheme: tp.Callable,
-        activation: tp.Callable = Activations.neaty_sigmoid,
+        init_scheme: tp.Callable = InitSchemes.uniform,
+        activation: tp.Callable = Activations.neat_sigmoid,
+        fitness_function: tp.Callable[["Genome"], float] = None,
     ) -> tp.List["Genome"]:
 
         # add bias
@@ -94,11 +115,29 @@ class Genome:
                             outputs[output],
                             init_scheme(input_nodes, output_nodes),
                             True,
-                            input * output_nodes + output + 1,
+                            # input * output_nodes + output + 1,
                         )
                     )
-            population_out.append(Genome(inputs, outputs, [], connections, activation))
+            population_out.append(
+                Genome(
+                    inputs,
+                    outputs,
+                    [],
+                    connections,
+                    activation=activation,
+                    fitness_function=fitness_function,
+                )
+            )
+            if fitness_function is not None:
+                population_out[-1].evaluate_fitness()
         return population_out
+
+    def evaluate_fitness(self) -> None:
+        self._fitness = self.fitness_function(self)
+
+    @property
+    def fitness(self) -> float:
+        return max(0, self._fitness)
 
     @staticmethod
     def distance(
@@ -136,7 +175,6 @@ class Genome:
     def crossover(
         parent1: "Genome",
         parent2: "Genome",
-        p1_fitter: bool,
         disable_probability: float = 0.1,
     ) -> "Genome":
         # Matching
@@ -149,10 +187,12 @@ class Genome:
         matching = innovations1.keys() & innovations2.keys()
         disjoint = (
             innovations1.keys() - innovations2.keys()
-            if p1_fitter
+            if parent1.fitness > parent2.fitness
             else innovations2.keys() - innovations1.keys()
         )
-        disjoint_source = innovations1 if p1_fitter else innovations2
+        disjoint_source = (
+            innovations1 if parent1.fitness > parent2.fitness else innovations2
+        )
 
         # Offspring setup
         inputs = parent1.inputs
@@ -166,8 +206,17 @@ class Genome:
         # Crossover matching
         for innovation in matching:
             source = innovations1 if np.random.random() < 0.5 else innovations2
-            connections.append(source[innovation])
-            for node in (source[innovation].in_node, source[innovation].out_node):
+            inheritance = source[innovation]
+            enabled = inheritance.enabled
+            if (
+                not innovations1[innovation].enabled
+                or not innovations2[innovation].enabled
+            ):
+                enabled = np.random.random() > disable_probability
+
+            connections.append(dataclasses.replace(inheritance, enabled=enabled))
+
+            for node in (inheritance.in_node, inheritance.out_node):
                 if node.id not in seen:
                     seen.add(node.id)
                     if node.node_type == NodeType.HIDDEN:
@@ -175,7 +224,9 @@ class Genome:
                         hidden.append(node)
         # Crossover disjoint
         for innovation in disjoint:
-            connections.append(disjoint_source[innovation])
+            inheritance = disjoint_source[innovation]
+
+            connections.append(dataclasses.replace(inheritance))
             for node in (
                 disjoint_source[innovation].in_node,
                 disjoint_source[innovation].out_node,
@@ -193,6 +244,18 @@ class Genome:
             connections,
             parent1.activation,
             parent1.output_activation,
+            fitness_function=parent1.fitness_function,
+        )
+
+    def clone(self) -> "Genome":
+        return Genome(
+            self.inputs,
+            self.outputs,
+            [dataclasses.replace(x) for x in self.hidden],
+            [dataclasses.replace(x) for x in self.connections],
+            activation=self.activation,
+            output_activation=self.output_activation,
+            fitness_function=self.fitness_function,
         )
 
     def mutate_perturb_weights(
@@ -235,7 +298,7 @@ class Genome:
         )
 
         if not possible_connections:
-            return
+            return False
 
         connection = possible_connections[
             np.random.choice(range(len(possible_connections)))
@@ -246,9 +309,10 @@ class Genome:
                 connection[1],
                 np.random.uniform(-1, 1),
                 True,
-                len(self.connections),
+                # self.next_innovation(),
             )
         )
+        return True
 
     def mutate_add_node(self):
         connection: ConnectionGene = np.random.choice(self.connections)
@@ -285,7 +349,7 @@ class Genome:
                 new_node,
                 1.0,
                 True,
-                len(self.connections) + 1,
+                # self.next_innovation(),
             )
         )
 
@@ -295,7 +359,7 @@ class Genome:
                 connection.out_node,
                 connection.weight,
                 True,
-                len(self.connections) + 1,
+                # self.next_innovation(),
             )
         )
 
@@ -350,7 +414,9 @@ class Genome:
                             * self.previous_activation.get(edge.in_node.id, 0)
                         )
                     else:
-                        current_activation += edge.weight * current[edge.in_node.id]
+                        current_activation += edge.weight * current.get(
+                            edge.in_node.id, 0
+                        )
                     if verbose:
                         print(
                             f"Edge: {edge.in_node.id} -> {edge.out_node.id} : Activation {current_activation}"
@@ -363,7 +429,7 @@ class Genome:
                 print(f"Node: {output.id}")
             current_activation = 0
             for edge in edges:
-                current_activation += edge.weight * current[edge.in_node.id]
+                current_activation += edge.weight * current.get(edge.in_node.id, 0)
                 if verbose:
                     print(
                         f"Edge: {edge.in_node.id} -> {edge.out_node.id} : Activation {current_activation}"
@@ -377,7 +443,7 @@ class Genome:
         # persist state to use for recurrent connections
         self.previous_activation = current
 
-        return tuple(current[output.id] for output in self.outputs)
+        return tuple(current.get(output.id, 0) for output in self.outputs)
 
     def __str__(self):
         out = f"Max Depth : {self.max_layer}\n"
@@ -385,8 +451,11 @@ class Genome:
         out += f"Hidden : {[(f.id, f.layer_level) for f in self.hidden]}\n"
         out += f"Output : {[f.id for f in self.outputs]}\n"
         out += f"Connections : \n"
-
         for f in self.connections:
             out += f"{f.innovation}) {f.in_node.id} -> {f.out_node.id} : {f.enabled} @ {f.weight}\n"
+        out += f"Fitness {self.fitness}: \n"
 
         return out
+
+    def __repr__(self) -> str:
+        return self.__str__()

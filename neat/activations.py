@@ -3,7 +3,7 @@ import numpy as np
 
 class Activations:
     @staticmethod
-    def neaty_sigmoid(x: float) -> float:
+    def neat_sigmoid(x: float) -> float:
         return 1 / (1 + np.exp(-4.9 * x))
 
     @staticmethod
